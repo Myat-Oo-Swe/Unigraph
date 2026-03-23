@@ -6,9 +6,9 @@ from sentence_transformers import SentenceTransformer
 # =========================
 # PATH SETUP
 # =========================
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-DB_PATH   = os.path.normpath(os.path.join(BASE_DIR, "..", "chroma_db"))
-DATA_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", "data", "processed", "documents.json"))
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+DB_PATH       = os.path.normpath(os.path.join(BASE_DIR, "..", "chroma_db"))
+PENDING_PATH  = os.path.normpath(os.path.join(BASE_DIR, "..", "data", "processed", "pending_changes.json"))
 
 # =========================
 # LOAD EMBEDDING MODEL
@@ -16,43 +16,104 @@ DATA_PATH = os.path.normpath(os.path.join(BASE_DIR, "..", "data", "processed", "
 model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 # =========================
-# INIT CHROMA (PERSISTENT)
-# Improvement: delete the existing collection before recreating it.
-#              Without this, re-running embed.py appends duplicates on top
-#              of the previous run, bloating the DB and corrupting results.
+# INIT CHROMA
+# We no longer wipe the entire collection on every run.
+# get_or_create_collection ensures the DB is created on first run
+# and reused on all subsequent runs.
 # =========================
-client = chromadb.PersistentClient(path=DB_PATH)
-
-existing = [c.name for c in client.list_collections()]
-if "unigraph" in existing:
-    client.delete_collection("unigraph")
-    print("🗑️  Deleted existing 'unigraph' collection — starting fresh.")
-
-collection = client.create_collection(name="unigraph")
+client     = chromadb.PersistentClient(path=DB_PATH)
+collection = client.get_or_create_collection(name="unigraph")
 
 # =========================
-# LOAD DATA
+# LOAD PENDING CHANGES
+# ingest.py writes pending_changes.json with:
+#   - changed_filenames : files whose old chunks must be deleted
+#   - new_chunks        : chunks that need to be embedded + stored
 # =========================
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    documents = json.load(f)
+if not os.path.exists(PENDING_PATH):
+    print("⚠️  pending_changes.json not found.")
+    print("    Run ingest.py first before running embed.py")
+    exit(1)
 
-print(f"Loaded {len(documents)} chunks")
+with open(PENDING_PATH, "r", encoding="utf-8") as f:
+    pending = json.load(f)
 
-texts     = [doc["text"]   for doc in documents]
-ids       = [doc["id"]     for doc in documents]
-metadatas = [{"source": doc["source"]} for doc in documents]
+changed_filenames = pending.get("changed_filenames", [])
+new_chunks        = pending.get("new_chunks",        [])
+
+if not changed_filenames and not new_chunks:
+    print("✅ Nothing to embed — all files are already up to date.")
+    exit(0)
+
+print(f"📋 Pending changes:")
+print(f"   Files to update  : {changed_filenames if changed_filenames else 'none'}")
+print(f"   New chunks to add: {len(new_chunks)}")
 
 # =========================
-# EMBED + STORE
+# STEP 1 — DELETE STALE CHUNKS FOR CHANGED FILES
+# For each changed file, find all its chunk IDs currently in
+# ChromaDB and delete them before adding the new version.
+# This prevents old and new versions of the same file coexisting.
 # =========================
-print("Creating embeddings...")
-embeddings = model.encode(texts, show_progress_bar=True).tolist()
+if changed_filenames:
+    print(f"\n🗑️  Removing stale chunks for changed files...")
+    for filename in changed_filenames:
+        # Query ChromaDB for all chunks whose source matches this file
+        results = collection.get(
+            where={"source": {"$eq": filename}},
+            include=[]   # we only need the IDs
+        )
+        stale_ids = results.get("ids", [])
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+            print(f"   Deleted {len(stale_ids)} stale chunks for: {filename}")
+        else:
+            print(f"   No existing chunks found for: {filename} (skipping delete)")
 
-collection.add(
-    documents=texts,
-    embeddings=embeddings,
-    ids=ids,
-    metadatas=metadatas
-)
+# =========================
+# STEP 2 — EMBED + STORE NEW CHUNKS
+# =========================
+if new_chunks:
+    print(f"\n⚙️  Embedding {len(new_chunks)} new chunks...")
 
-print(f"✅ Stored {len(texts)} chunks in ChromaDB at: {DB_PATH}")
+    texts     = [doc["text"]   for doc in new_chunks]
+    ids       = [doc["id"]     for doc in new_chunks]
+    metadatas = [
+        {
+            "source":        doc.get("source",        "unknown"),
+            "page_number":   doc.get("page_number",   -1),
+            "section_title": doc.get("section_title", "—"),
+            "document_type": doc.get("document_type", "general"),
+            "language":      doc.get("language",      "unknown"),
+            "chunk_type":    doc.get("chunk_type",     "text"),
+        }
+        for doc in new_chunks
+    ]
+
+    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+
+    # Add in batches of 500 to avoid memory spikes on large document sets
+    BATCH_SIZE = 500
+    for i in range(0, len(new_chunks), BATCH_SIZE):
+        batch_end = min(i + BATCH_SIZE, len(new_chunks))
+        collection.add(
+            documents=texts[i : batch_end],
+            embeddings=embeddings[i : batch_end],
+            ids=ids[i : batch_end],
+            metadatas=metadatas[i : batch_end],
+        )
+        print(f"   Stored batch {i // BATCH_SIZE + 1} "
+              f"({i + 1}–{batch_end} of {len(new_chunks)})")
+
+# =========================
+# STEP 3 — CLEAR PENDING FILE
+# Mark pending_changes.json as empty so re-running embed.py
+# without new ingest.py changes does nothing.
+# =========================
+with open(PENDING_PATH, "w", encoding="utf-8") as f:
+    json.dump({"changed_filenames": [], "new_chunks": []}, f)
+
+total = collection.count()
+print(f"\n✅ Done.")
+print(f"   Total chunks in ChromaDB : {total}")
+print(f"   DB path                  : {DB_PATH}")
